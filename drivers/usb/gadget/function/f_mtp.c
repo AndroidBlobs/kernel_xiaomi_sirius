@@ -610,17 +610,7 @@ static ssize_t mtp_read(struct file *fp, char __user *buf,
 		return -EINVAL;
 
 	spin_lock_irq(&dev->lock);
-	if (dev->state == STATE_OFFLINE) {
-		spin_unlock_irq(&dev->lock);
-		return -ENODEV;
-	}
-
 	if (dev->ep_out->desc) {
-		if (!cdev) {
-			spin_unlock_irq(&dev->lock);
-			return -ENODEV;
-		}
-
 		len = usb_ep_align_maybe(cdev->gadget, dev->ep_out, count);
 		if (len > MTP_BULK_BUFFER_SIZE) {
 			spin_unlock_irq(&dev->lock);
@@ -1503,7 +1493,6 @@ mtp_function_unbind(struct usb_configuration *c, struct usb_function *f)
 	kfree(f->os_desc_table);
 	f->os_desc_n = 0;
 	fi_mtp->func_inst.f = NULL;
-	dev->cdev = NULL;
 }
 
 static int mtp_function_set_alt(struct usb_function *f,
@@ -1556,9 +1545,7 @@ static void mtp_function_disable(struct usb_function *f)
 	struct usb_composite_dev	*cdev = dev->cdev;
 
 	DBG(cdev, "mtp_function_disable\n");
-	spin_lock_irq(&dev->lock);
 	dev->state = STATE_OFFLINE;
-	spin_unlock_irq(&dev->lock);
 	usb_ep_disable(dev->ep_in);
 	usb_ep_disable(dev->ep_out);
 	usb_ep_disable(dev->ep_intr);
@@ -1903,7 +1890,6 @@ struct usb_function *function_alloc_mtp_ptp(struct usb_function_instance *fi,
 	dev->function.disable = mtp_function_disable;
 	dev->function.setup = mtp_ctrlreq_configfs;
 	dev->function.free_func = mtp_free;
-	fi->f = &dev->function;
 
 	return &dev->function;
 }
