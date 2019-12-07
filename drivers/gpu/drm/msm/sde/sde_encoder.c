@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2014-2018, The Linux Foundation. All rights reserved.
  * Copyright (C) 2013 Red Hat
+ * Copyright (C) 2018 XiaoMi, Inc.
  * Author: Rob Clark <robdclark@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -2309,9 +2310,9 @@ static int sde_encoder_resource_control(struct drm_encoder *drm_enc,
 			 * such case.
 			 */
 			kthread_mod_delayed_work(&disp_thread->worker,
-					&sde_enc->delayed_off_work,
-					msecs_to_jiffies(
-					IDLE_POWERCOLLAPSE_IN_EARLY_WAKEUP));
+						&sde_enc->delayed_off_work,
+						msecs_to_jiffies(
+						IDLE_POWERCOLLAPSE_IN_EARLY_WAKEUP));
 
 			sde_enc->rc_state = SDE_ENC_RC_STATE_ON;
 		}
@@ -4845,12 +4846,13 @@ int sde_encoder_display_failure_notification(struct drm_encoder *enc)
 	SDE_EVT32_VERBOSE(DRMID(enc));
 
 	disp_thread = &priv->disp_thread[sde_enc->crtc->index];
+
 	if (current->tgid == disp_thread->thread->tgid) {
 		sde_encoder_resource_control(&sde_enc->base,
-					     SDE_ENC_RC_EVENT_KICKOFF);
+			SDE_ENC_RC_EVENT_KICKOFF);
 	} else {
 		kthread_queue_work(&disp_thread->worker,
-				   &sde_enc->esd_trigger_work);
+					&sde_enc->esd_trigger_work);
 		kthread_flush_work(&sde_enc->esd_trigger_work);
 	}
 	/**
