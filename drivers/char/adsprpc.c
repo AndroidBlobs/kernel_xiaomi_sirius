@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2018 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -1522,18 +1523,9 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		if (map && (map->attr & FASTRPC_ATTR_COHERENT))
 			continue;
 
-		if (rpra && rpra[i].buf.len && ctx->overps[oix]->mstart) {
-			if (map && map->handle)
-				msm_ion_do_cache_op(ctx->fl->apps->client,
-					map->handle,
-					uint64_to_ptr(rpra[i].buf.pv),
-					rpra[i].buf.len,
-					ION_IOC_CLEAN_INV_CACHES);
-			else
-				dmac_flush_range(uint64_to_ptr(rpra[i].buf.pv),
-					uint64_to_ptr(rpra[i].buf.pv
-						+ rpra[i].buf.len));
-		}
+		if (rpra && rpra[i].buf.len && ctx->overps[oix]->mstart)
+			dmac_flush_range(uint64_to_ptr(rpra[i].buf.pv),
+			uint64_to_ptr(rpra[i].buf.pv + rpra[i].buf.len));
 	}
 	PERF_END);
 	for (i = bufs; rpra && i < bufs + handles; i++) {
@@ -1542,6 +1534,11 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		rpra[i].dma.offset = (uint32_t)(uintptr_t)lpra[i].buf.pv;
 	}
 
+	if (!ctx->fl->sctx->smmu.coherent) {
+		PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_FLUSH),
+		dmac_flush_range((char *)rpra, (char *)rpra + ctx->used);
+		PERF_END);
+	}
  bail:
 	return err;
 }
@@ -1630,33 +1627,14 @@ static void inv_args_pre(struct smq_invoke_ctx *ctx)
 		if (buf_page_start(ptr_to_uint64((void *)rpra)) ==
 				buf_page_start(rpra[i].buf.pv))
 			continue;
-		if (!IS_CACHE_ALIGNED((uintptr_t)
-				uint64_to_ptr(rpra[i].buf.pv))) {
-			if (map && map->handle)
-				msm_ion_do_cache_op(ctx->fl->apps->client,
-					map->handle,
-					uint64_to_ptr(rpra[i].buf.pv),
-					sizeof(uintptr_t),
-					ION_IOC_CLEAN_INV_CACHES);
-			else
-				dmac_flush_range(
-					uint64_to_ptr(rpra[i].buf.pv), (char *)
-					uint64_to_ptr(rpra[i].buf.pv + 1));
-		}
-
+		if (!IS_CACHE_ALIGNED((uintptr_t)uint64_to_ptr(rpra[i].buf.pv)))
+			dmac_flush_range(uint64_to_ptr(rpra[i].buf.pv),
+				(char *)(uint64_to_ptr(rpra[i].buf.pv + 1)));
 		end = (uintptr_t)uint64_to_ptr(rpra[i].buf.pv +
 							rpra[i].buf.len);
-		if (!IS_CACHE_ALIGNED(end)) {
-			if (map && map->handle)
-				msm_ion_do_cache_op(ctx->fl->apps->client,
-						map->handle,
-						uint64_to_ptr(end),
-						sizeof(uintptr_t),
-						ION_IOC_CLEAN_INV_CACHES);
-			else
-				dmac_flush_range((char *)end,
-					(char *)end + 1);
-		}
+		if (!IS_CACHE_ALIGNED(end))
+			dmac_flush_range((char *)end,
+				(char *)end + 1);
 	}
 }
 
@@ -1665,6 +1643,7 @@ static void inv_args(struct smq_invoke_ctx *ctx)
 	int i, inbufs, outbufs;
 	uint32_t sc = ctx->sc;
 	remote_arg64_t *rpra = ctx->rpra;
+	int used = ctx->used;
 
 	inbufs = REMOTE_SCALARS_INBUFS(sc);
 	outbufs = REMOTE_SCALARS_OUTBUFS(sc);
@@ -1695,6 +1674,8 @@ static void inv_args(struct smq_invoke_ctx *ctx)
 						 + rpra[i].buf.len));
 	}
 
+	if (rpra)
+		dmac_inv_range(rpra, (char *)rpra + used);
 }
 
 static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
@@ -2688,7 +2669,8 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 	spin_unlock(&fl->apps->hlock);
 
 	if (!fl->sctx) {
-		goto bail;
+		kfree(fl);
+		return 0;
 	}
 	spin_lock(&fl->hlock);
 	fl->file_close = 1;
@@ -2721,11 +2703,8 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 		kfree(fperf);
 	} while (fperf);
 	mutex_unlock(&fl->perf_mutex);
-
-bail:
 	mutex_destroy(&fl->perf_mutex);
 	mutex_destroy(&fl->fl_map_mutex);
-	mutex_destroy(&fl->map_mutex);
 	kfree(fl);
 	return 0;
 }
@@ -2739,6 +2718,7 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 			pm_qos_remove_request(&fl->pm_qos_req);
 		if (fl->debugfs_file != NULL)
 			debugfs_remove(fl->debugfs_file);
+		mutex_destroy(&fl->map_mutex);
 		fastrpc_file_free(fl);
 		file->private_data = NULL;
 	}
@@ -3217,28 +3197,6 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 		if (err)
 			goto bail;
 		break;
-	case FASTRPC_IOCTL_MMAP_64:
-		K_COPY_FROM_USER(err, 0, &p.mmap, param,
-						sizeof(p.mmap));
-		if (err)
-			goto bail;
-		VERIFY(err, 0 == (err = fastrpc_internal_mmap(fl, &p.mmap)));
-		if (err)
-			goto bail;
-		K_COPY_TO_USER(err, 0, param, &p.mmap, sizeof(p.mmap));
-		if (err)
-			goto bail;
-		break;
-	case FASTRPC_IOCTL_MUNMAP_64:
-		K_COPY_FROM_USER(err, 0, &p.munmap, param,
-						sizeof(p.munmap));
-		if (err)
-			goto bail;
-		VERIFY(err, 0 == (err = fastrpc_internal_munmap(fl,
-							&p.munmap)));
-		if (err)
-			goto bail;
-		break;
 	case FASTRPC_IOCTL_MUNMAP_FD:
 		K_COPY_FROM_USER(err, 0, &p.munmap_fd, param,
 			sizeof(p.munmap_fd));
@@ -3447,16 +3405,17 @@ static int fastrpc_get_service_location_notify(struct notifier_block *nb,
 				pdr->domain_list[0].name,
 				pdr->domain_list[0].instance_id,
 				&spd->pdrnb, &curr_state);
-		if (IS_ERR(spd->pdrhandle)) {
+		pr_err("%s ADSPRPC:Calling service_notif_register name %s instance_id %d curr_state %X\n", __func__, pdr->domain_list[0].name, pdr->domain_list[0].instance_id, curr_state);
+		if (IS_ERR(spd->pdrhandle))
 			pr_err("ADSPRPC: Unable to register notifier\n");
-		} else if (curr_state == SERVREG_NOTIF_SERVICE_STATE_UP_V01) {
-			pr_info("ADSPRPC: SERVREG_NOTIF_SERVICE_STATE_UP_V01 received\n");
-			spd->ispdup = 1;
-		} else if (curr_state == SERVREG_NOTIF_SERVICE_STATE_UNINIT_V01) {
-			pr_info("ADSPRPC: SERVREG_NOTIF_SERVICE_STATE_UNINIT_V01 received\n");
-		}
-	} else {
+	} else
 		pr_err("ADSPRPC: Service returned invalid domains\n");
+
+	if (curr_state == SERVREG_NOTIF_SERVICE_STATE_UP_V01) {
+		pr_info("SERVREG_NOTIF_SERVICE_STATE_UP_V01 received\n");
+		spd->ispdup = 1;
+	} else if (curr_state == SERVREG_NOTIF_SERVICE_STATE_UNINIT_V01) {
+		pr_info("SERVREG_NOTIF_SERVICE_STATE_UNINIT_V01  received\n");
 	}
 
 	return NOTIFY_DONE;
